@@ -31,7 +31,9 @@ python -m venv .venv
 .\.venv\Scripts\python main.py      # or pythonw main.py to run without a console
 ```
 
-To use the tray icon, right-click it and choose **Enabled** (toggle), **Reload config**, **Open config.json**, or **Quit**. Double-clicking the icon also toggles it on or off. Only one copy of the app runs at a time.
+To use the tray icon, right-click it and choose **Enabled** (toggle), **Run at startup**, **Reload config**, **Open config.json**, or **Quit**. Double-clicking the icon also toggles it on or off. Only one copy of the app runs at a time.
+
+**Run at startup** adds a per-user entry under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, so it doesn't need admin rights. If you move the exe later, the entry is corrected the next time the app starts.
 
 ## Build a single .exe
 
@@ -40,7 +42,7 @@ To use the tray icon, right-click it and choose **Enabled** (toggle), **Reload c
 .\.venv\Scripts\pyinstaller --noconfirm --onefile --noconsole --name ShakeToFind --hidden-import pystray._win32 main.py
 ```
 
-The output is `dist\ShakeToFind.exe`. It creates `config.json` in the same folder as the exe. The first launch can take a few seconds while the onefile package unpacks. To start it with Windows, put a shortcut in `shell:startup`.
+The output is `dist\ShakeToFind.exe`. It creates `config.json` in the same folder as the exe. The first launch can take a few seconds while the onefile package unpacks. To start it with Windows, turn on **Run at startup** in the tray menu.
 
 ## config.json
 
