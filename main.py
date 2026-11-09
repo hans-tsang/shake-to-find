@@ -22,7 +22,7 @@ pixels in the virtual-screen space (works across multiple monitors) and the
 cursor size / thresholds are scaled by the DPI of the monitor under the cursor.
 """
 
-__version__ = "0.1.0"  # x-release-please-version
+__version__ = "0.2.0"  # x-release-please-version
 
 import ctypes
 import ctypes.wintypes as wt
