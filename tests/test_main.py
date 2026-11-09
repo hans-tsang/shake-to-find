@@ -35,5 +35,23 @@ class CursorArtTest(unittest.TestCase):
         self.assertEqual(hot, 10)
 
 
+class StartupTest(unittest.TestCase):
+    def setUp(self):
+        self._orig = main.RUN_NAME
+        main.RUN_NAME = "ShakeToFindUnitTest"  # never touch the real entry
+
+    def tearDown(self):
+        main.set_startup(False)
+        main.RUN_NAME = self._orig
+
+    def test_enable_and_disable(self):
+        main.set_startup(True)
+        self.assertTrue(main.is_startup_enabled())
+        self.assertEqual(main.get_startup_value(), main.startup_command())
+        main.set_startup(False)
+        self.assertFalse(main.is_startup_enabled())
+        main.set_startup(False)  # disabling twice is harmless
+
+
 if __name__ == "__main__":
     unittest.main()

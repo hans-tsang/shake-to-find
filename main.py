@@ -219,6 +219,46 @@ def save_config(cfg):
 
 
 # ---------------------------------------------------------------------------
+# Run at startup (per-user HKCU Run key; no admin rights needed)
+# ---------------------------------------------------------------------------
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_NAME = "ShakeToFind"
+
+
+def startup_command():
+    """Command line Windows runs at sign-in: the .exe, or pythonw + this script."""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if not os.path.exists(pyw):
+        pyw = sys.executable
+    return f'"{pyw}" "{os.path.abspath(__file__)}"'
+
+
+def get_startup_value():
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            return winreg.QueryValueEx(k, RUN_NAME)[0]
+    except OSError:
+        return None
+
+
+def is_startup_enabled():
+    return get_startup_value() is not None
+
+
+def set_startup(enabled):
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+        if enabled:
+            winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ, startup_command())
+        else:
+            try:
+                winreg.DeleteValue(k, RUN_NAME)
+            except FileNotFoundError:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # DPI helpers
 # ---------------------------------------------------------------------------
 def monitor_dpi(x, y):
@@ -443,6 +483,12 @@ class App:
         icon.icon = make_tray_image(self.enabled)
         icon.title = f"Shake to Find {__version__} ({'on' if self.enabled else 'off'})"
 
+    def _toggle_startup(self, icon, item):
+        try:
+            set_startup(not is_startup_enabled())
+        except OSError as e:
+            icon.notify(f"Could not change startup setting: {e}", "Shake to Find")
+
     def _reload(self, icon, item):
         self.reload_requested.set()
 
@@ -456,6 +502,9 @@ class App:
     def start_tray(self):
         menu = pystray.Menu(
             pystray.MenuItem("Enabled", self._toggle, checked=lambda i: self.enabled, default=True),
+            pystray.MenuItem("Run at startup", self._toggle_startup,
+                             checked=lambda i: is_startup_enabled()),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Reload config", self._reload),
             pystray.MenuItem("Open config.json", self._open_config),
             pystray.Menu.SEPARATOR,
@@ -540,6 +589,13 @@ def main():
     if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
         print("Shake to Find is already running.", file=sys.stderr)
         return 1
+    # If startup is enabled but the app was moved/rebuilt elsewhere, fix the path.
+    value = get_startup_value()
+    if value is not None and value != startup_command():
+        try:
+            set_startup(True)
+        except OSError:
+            pass
     App().run()
     return 0
 
