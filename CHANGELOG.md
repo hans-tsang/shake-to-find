@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/hans-tsang/shake-to-find/compare/v0.2.0...v0.3.0) (2026-11-17)
+
+
+### Features
+
+* macOS-style look with spring bounce, glow, gradient and ripple rings ([5ac44aa](https://github.com/hans-tsang/shake-to-find/commit/5ac44aaf81b86df3a3c3868db862d7cf5814cc37))
+
 ## [0.2.0](https://github.com/hans-tsang/shake-to-find/compare/v0.1.0...v0.2.0) (2026-11-09)
 
 
