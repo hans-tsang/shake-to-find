@@ -10,10 +10,12 @@ How it works
 * A ShakeDetector looks at horizontal movement over a sliding time window and
   reports a "shake" when there are enough direction reversals and enough travel.
 * On shake, an Overlay window (borderless, click-through, always-on-top,
-  per-pixel-alpha layered window) draws a large arrow whose tip sits exactly
-  on the real cursor hotspot, so it follows the real cursor.
-* After `hold_ms` without shaking, the arrow shrinks smoothly back to normal
-  size and the overlay is hidden.
+  per-pixel-alpha layered window) draws a large macOS-style arrow (gradient
+  fill, white outline, soft glow and drop shadow) whose tip sits exactly on the
+  real cursor hotspot, so it follows the real cursor. It pops in with a springy
+  bounce, and ripple rings pulse out from the tip while shaking continues.
+* After `hold_ms` without shaking, a critically damped spring shrinks the arrow
+  smoothly back to normal size and the overlay is hidden.
 * A pystray tray icon (running in its own thread) offers Enable/Disable,
   reload/open config and Quit.
 
@@ -173,8 +175,24 @@ DEFAULT_CONFIG = {
     "cursor_scale": 5.0,           # enlarged size relative to the normal cursor
     "base_cursor_px": 0,           # normal cursor size at 96 DPI; 0 = read from Windows
     "hold_ms": 1000,               # stay big this long after the last shake
-    "grow_speed": 18.0,            # exponential animation rates (1/s); higher = faster
-    "shrink_speed": 7.0,
+    # Spring animation: stiffness (higher = faster), damping ratio (<1 = bouncy overshoot).
+    "grow_stiffness": 260.0,
+    "grow_damping": 0.45,
+    "shrink_stiffness": 90.0,
+    "shrink_damping": 1.0,
+    # Look (RGB colors; defaults mimic macOS: black arrow, white outline, soft shadow).
+    "fill_top_color": [72, 72, 78],      # arrow gradient, top
+    "fill_bottom_color": [0, 0, 0],      # arrow gradient, bottom
+    "outline_color": [255, 255, 255],
+    "glow_color": [255, 255, 255],
+    "glow_opacity": 0.55,                # 0 disables the glow
+    "shadow_opacity": 0.45,              # 0 disables the drop shadow
+    # Ripple rings that pulse out from the cursor tip while shaking.
+    "ripple": True,
+    "ripple_color": [255, 255, 255],
+    "ripple_duration_ms": 650,
+    "ripple_interval_ms": 700,           # repeat while shaking continues
+    "ripple_max_radius": 1.25,           # relative to the enlarged arrow size
 }
 
 
@@ -201,6 +219,9 @@ def load_config():
                     cfg[key] = bool(val)
                 elif isinstance(default, (int, float)) and isinstance(val, (int, float)):
                     cfg[key] = type(default)(val)
+                elif (isinstance(default, list) and isinstance(val, list) and len(val) == len(default)
+                      and all(isinstance(v, (int, float)) for v in val)):
+                    cfg[key] = [int(max(0, min(255, v))) for v in val]
     except FileNotFoundError:
         save_config(cfg)
     except (OSError, ValueError) as e:
@@ -289,54 +310,143 @@ def system_cursor_base_px():
 # ---------------------------------------------------------------------------
 # Cursor artwork
 # ---------------------------------------------------------------------------
+def _scaled_mask(mask, factor):
+    """Multiply an 'L' mask by factor (0..1)."""
+    factor = max(0.0, min(1.0, factor))
+    return mask.point(lambda v: int(v * factor))
+
+
+def to_frame(img, hot_x, hot_y):
+    """PIL RGBA image -> (premultiplied BGRA bytes, w, h, hot_x, hot_y) for UpdateLayeredWindow."""
+    r, g, b, a = img.convert("RGBa").split()
+    return (Image.merge("RGBA", (b, g, r, a)).tobytes(), img.width, img.height, hot_x, hot_y)
+
+
 class CursorArt:
-    """Renders an anti-aliased macOS-style arrow once at high resolution, then
-    produces premultiplied BGRA frames at any size (cached)."""
+    """Renders an anti-aliased macOS-style arrow once at high resolution
+    (soft glow, drop shadow, white outline, gradient fill), then produces
+    frames at any size (cached)."""
 
     MASTER = 512  # master canvas is MASTER x MASTER
     # Arrow outline in "units"; tip (hotspot) at (0, 0). ~ classic pointer shape.
     ARROW = [(0, 0), (0, 17.5), (4.2, 13.6), (7.0, 20.2), (9.6, 19.1),
              (6.9, 12.6), (12.4, 12.6)]
-    UNITS = 32  # canvas spans 32 units, like a 32x32 cursor
+    UNITS = 32         # a normal cursor of N px spans 32 units (like a 32x32 cursor)
+    CANVAS_UNITS = 40  # canvas is larger than the cursor so the glow/shadow aren't clipped
+    PAD = 6.0          # units from the canvas top-left corner to the tip
 
-    def __init__(self):
-        s = self.MASTER / self.UNITS
-        pad = 2.0  # units of padding so the outline/shadow aren't clipped
-        self.hotspot = pad / self.UNITS  # fraction of canvas size
-        pts = [((x + pad) * s, (y + pad) * s) for x, y in self.ARROW]
+    def __init__(self, cfg=None):
+        cfg = cfg or DEFAULT_CONFIG
+        M = self.MASTER
+        s = M / self.CANVAS_UNITS
+        self.hotspot = self.PAD / self.CANVAS_UNITS  # fraction of canvas size
+        pts = [((x + self.PAD) * s, (y + self.PAD) * s) for x, y in self.ARROW]
         outline = 1.3 * s
 
-        # Soft drop shadow.
-        shadow = Image.new("L", (self.MASTER, self.MASTER), 0)
-        sd = ImageDraw.Draw(shadow)
-        off = 0.6 * s
-        sd.polygon([(x + off, y + off * 1.5) for x, y in pts], fill=110)
-        sd.line([(x + off, y + off * 1.5) for x, y in pts + pts[:1]], fill=110,
-                width=int(outline * 2), joint="curve")
-        shadow = shadow.filter(ImageFilter.GaussianBlur(0.8 * s))
+        def shape(dx=0.0, dy=0.0, grow=0.0, blur=0.0):
+            """'L' mask of the arrow, optionally offset, grown (rounded) and blurred."""
+            m = Image.new("L", (M, M), 0)
+            d = ImageDraw.Draw(m)
+            p = [(x + dx, y + dy) for x, y in pts]
+            d.polygon(p, fill=255)
+            if grow:
+                d.line(p + p[:1], fill=255, width=int(grow * 2), joint="curve")
+                for x, y in p:  # round the outer corners
+                    d.ellipse([x - grow, y - grow, x + grow, y + grow], fill=255)
+            return m.filter(ImageFilter.GaussianBlur(blur)) if blur else m
 
-        img = Image.new("RGBA", (self.MASTER, self.MASTER), (0, 0, 0, 0))
-        img.putalpha(shadow)
-        d = ImageDraw.Draw(img)
-        d.line(pts + pts[:1], fill=(255, 255, 255, 255), width=int(outline * 2), joint="curve")
-        for x, y in pts:  # round outer corners
-            d.ellipse([x - outline, y - outline, x + outline, y + outline], fill=(255, 255, 255, 255))
-        d.polygon(pts, fill=(0, 0, 0, 255))
+        def layer(color, mask):
+            im = Image.new("RGBA", (M, M), tuple(color) + (0,))
+            im.putalpha(mask)
+            return im
+
+        img = Image.new("RGBA", (M, M), (0, 0, 0, 0))
+        # 1. Soft halo so the arrow pops on dark backgrounds.
+        if cfg["glow_opacity"] > 0:
+            glow = shape(grow=outline * 1.8, blur=1.1 * s)
+            img.alpha_composite(layer(cfg["glow_color"], _scaled_mask(glow, cfg["glow_opacity"])))
+        # 2. Drop shadow (down-right) so it pops on light backgrounds.
+        if cfg["shadow_opacity"] > 0:
+            shadow = shape(dx=0.5 * s, dy=0.9 * s, grow=outline, blur=0.9 * s)
+            img.alpha_composite(layer((0, 0, 0), _scaled_mask(shadow, cfg["shadow_opacity"])))
+        # 3. Rounded outline.
+        img.alpha_composite(layer(cfg["outline_color"], shape(grow=outline)))
+        # 4. Vertical gradient fill clipped to the arrow.
+        ys = [y for _, y in pts]
+        top, bottom = int(min(ys)), int(max(ys)) + 1
+        grad = Image.new("L", (M, M), 255)
+        grad.paste(Image.linear_gradient("L").resize((M, bottom - top)), (0, top))
+        fill = Image.composite(Image.new("RGBA", (M, M), tuple(cfg["fill_bottom_color"]) + (255,)),
+                               Image.new("RGBA", (M, M), tuple(cfg["fill_top_color"]) + (255,)), grad)
+        fill.putalpha(shape())
+        img.alpha_composite(fill)
+
         self.master = img
-        self._cache = {}
+        self._images = {}
+        self._frames = {}
+
+    def image(self, size):
+        """Return (RGBA canvas image, hotspot_px) for an arrow of cursor size `size`."""
+        size = max(8, int(round(size)))
+        hit = self._images.get(size)
+        if hit is None:
+            if len(self._images) > 256:
+                self._images.clear()
+            px = int(round(size * self.CANVAS_UNITS / self.UNITS))
+            hit = self._images[size] = (self.master.resize((px, px), Image.LANCZOS),
+                                        int(round(self.hotspot * px)))
+        return hit
 
     def frame(self, size):
-        """Return (bgra_premultiplied_bytes, size, hotspot_px) for a size x size frame."""
+        """Return a cached frame (see to_frame) for an arrow of cursor size `size`."""
         size = max(8, int(round(size)))
-        hit = self._cache.get(size)
+        hit = self._frames.get(size)
         if hit is None:
-            img = self.master.resize((size, size), Image.LANCZOS).convert("RGBa")
-            r, g, b, a = img.split()
-            data = Image.merge("RGBA", (b, g, r, a)).tobytes()  # BGRA, premultiplied
-            if len(self._cache) > 256:
-                self._cache.clear()
-            hit = self._cache[size] = (data, size, int(round(self.hotspot * size)))
+            img, hot = self.image(size)
+            if len(self._frames) > 256:
+                self._frames.clear()
+            hit = self._frames[size] = to_frame(img, hot, hot)
         return hit
+
+
+def compose_ripples(art, size, ripples, now, cfg):
+    """Frame with the arrow plus expanding, fading rings centred on the tip.
+    `ripples` is a list of spawn times (seconds)."""
+    arrow, hot = art.image(size)
+    dur = cfg["ripple_duration_ms"] / 1000.0
+    max_r = cfg["ripple_max_radius"] * size
+    ring_w = max(2.0, size * 0.035)
+    half = int(max(max_r + ring_w * 2, arrow.width)) + 2  # canvas half-size, tip at centre
+    ss = 2  # supersample for anti-aliased rings
+    dark = Image.new("L", (half * 2 * ss,) * 2, 0)
+    light = Image.new("L", (half * 2 * ss,) * 2, 0)
+    dd, dl = ImageDraw.Draw(dark), ImageDraw.Draw(light)
+    c = half * ss
+    for t0 in ripples:
+        p = min(1.0, max(0.0, (now - t0) / dur))
+        r = (0.15 + 0.85 * (1 - (1 - p) ** 3)) * max_r * ss  # ease-out cubic
+        alpha = (1 - p) ** 2
+        w = ring_w * ss * (1.0 - 0.5 * p)
+        dd.ellipse([c - r - w, c - r - w, c + r + w, c + r + w],
+                   outline=int(120 * alpha), width=max(1, int(w * 2)))
+        dl.ellipse([c - r, c - r, c + r, c + r], outline=int(235 * alpha), width=max(1, int(w)))
+    size_px = (half * 2, half * 2)
+    canvas = Image.new("RGBA", size_px, (0, 0, 0, 0))
+    shade = Image.new("RGBA", size_px, (0, 0, 0, 0))
+    shade.putalpha(dark.resize(size_px, Image.BOX))
+    canvas.alpha_composite(shade)
+    ring = Image.new("RGBA", size_px, tuple(cfg["ripple_color"]) + (0,))
+    ring.putalpha(light.resize(size_px, Image.BOX))
+    canvas.alpha_composite(ring)
+    canvas.alpha_composite(arrow, (half - hot, half - hot))
+    return to_frame(canvas, half, half)
+
+
+def spring_step(x, v, target, stiffness, damping_ratio, dt):
+    """One semi-implicit Euler step of a damped spring. Returns (x, v)."""
+    c = 2.0 * damping_ratio * math.sqrt(stiffness)
+    v += (stiffness * (target - x) - c * v) * dt
+    return x + v * dt, v
 
 
 # ---------------------------------------------------------------------------
@@ -370,13 +480,13 @@ class Overlay:
 
     def show_frame(self, frame, x, y):
         """Display `frame` with its hotspot at screen position (x, y)."""
-        data, size, hot = frame
-        dst = wt.POINT(x - hot, y - hot)
+        data, w, h, hot_x, hot_y = frame
+        dst = wt.POINT(x - hot_x, y - hot_y)
         if frame is self._last_frame:
             # Same bitmap: just move the window (cheap).
             SetWindowPos(self.hwnd, HWND_TOPMOST, dst.x, dst.y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE)
         else:
-            bmi = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), size, -size, 1, 32, 0)
+            bmi = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), w, -h, 1, 32, 0)
             bits = ctypes.c_void_p()
             hbmp = CreateDIBSection(self.mem_dc, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
             if not hbmp:
@@ -384,7 +494,7 @@ class Overlay:
             ctypes.memmove(bits, data, len(data))
             old = SelectObject(self.mem_dc, hbmp)
             UpdateLayeredWindow(self.hwnd, self.screen_dc, ctypes.byref(dst),
-                                ctypes.byref(wt.SIZE(size, size)), self.mem_dc,
+                                ctypes.byref(wt.SIZE(w, h)), self.mem_dc,
                                 ctypes.byref(wt.POINT(0, 0)), 0, ctypes.byref(self._blend), ULW_ALPHA)
             SelectObject(self.mem_dc, old)
             DeleteObject(hbmp)
@@ -516,14 +626,16 @@ class App:
 
     # -- main loop (main thread: owns the overlay window) --
     def run(self):
-        art = CursorArt()
+        art = CursorArt(self.cfg)
         overlay = Overlay()
         detector = ShakeDetector(self.cfg)
         base_px = self.cfg["base_cursor_px"] or system_cursor_base_px()
         self.start_tray()
 
-        scale = 1.0           # current animated scale (1.0 = normal cursor size)
+        scale, vel = 1.0, 0.0  # spring-animated scale (1.0 = normal cursor size) and its velocity
         last_shake = -1e9
+        ripples = []           # spawn times of active ripple rings
+        last_ripple = -1e9
         msg = wt.MSG()
         pt = wt.POINT()
         winmm.timeBeginPeriod(1)  # 1 ms timer resolution so sleep(0.01) is accurate
@@ -541,31 +653,42 @@ class App:
                     self.enabled = self.cfg["enabled"]
                     detector = ShakeDetector(self.cfg)
                     base_px = self.cfg["base_cursor_px"] or system_cursor_base_px()
+                    art = CursorArt(self.cfg)
 
                 now = time.perf_counter()
-                dt, prev = now - prev, now
+                dt, prev = min(now - prev, 0.05), now  # clamp so the spring stays stable after stalls
                 cfg = self.cfg
 
                 if not self.enabled:
                     overlay.hide()
                     detector.reset()
-                    scale = 1.0
+                    scale, vel, ripples = 1.0, 0.0, []
                 elif GetCursorPos(ctypes.byref(pt)):  # fails on secure desktop / lock screen
                     dpi = monitor_dpi(pt.x, pt.y)
                     if detector.feed(now, pt.x, dpi / 96.0):
                         last_shake = now
+                        if cfg["ripple"] and (now - last_ripple) * 1000.0 >= cfg["ripple_interval_ms"]:
+                            ripples.append(now)
+                            last_ripple = now
 
                     big = (now - last_shake) * 1000.0 < cfg["hold_ms"]
-                    target = cfg["cursor_scale"] if big else 1.0
-                    rate = cfg["grow_speed"] if target > scale else cfg["shrink_speed"]
-                    scale += (target - scale) * (1.0 - math.exp(-rate * dt))
+                    if big:
+                        target, k, zeta = cfg["cursor_scale"], cfg["grow_stiffness"], cfg["grow_damping"]
+                    else:
+                        target, k, zeta = 1.0, cfg["shrink_stiffness"], cfg["shrink_damping"]
+                    scale, vel = spring_step(scale, vel, target, k, zeta, dt)
+                    scale = max(scale, 0.5)
+                    ripples = [t0 for t0 in ripples
+                               if (now - t0) * 1000.0 < cfg["ripple_duration_ms"]]
 
-                    if not big and scale < 1.03:
-                        scale = 1.0
+                    if not big and not ripples and abs(scale - 1.0) < 0.03 and abs(vel) < 0.5:
+                        scale, vel = 1.0, 0.0
                         overlay.hide()
                     elif big or overlay.visible:
                         size = base_px * dpi / 96.0 * scale
-                        overlay.show_frame(art.frame(size), pt.x, pt.y)
+                        frame = (compose_ripples(art, size, ripples, now, cfg) if ripples
+                                 else art.frame(size))
+                        overlay.show_frame(frame, pt.x, pt.y)
 
                 # Fixed-rate polling.
                 next_tick += cfg["poll_interval_ms"] / 1000.0

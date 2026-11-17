@@ -28,12 +28,37 @@ class ShakeDetectorTest(unittest.TestCase):
 
 
 class CursorArtTest(unittest.TestCase):
-    def test_frame_size_and_format(self):
-        data, size, hot = main.CursorArt().frame(160)
-        self.assertEqual(size, 160)
-        self.assertEqual(len(data), 160 * 160 * 4)
-        self.assertEqual(hot, 10)
+    def test_frame_size_and_hotspot(self):
+        data, w, h, hx, hy = main.CursorArt().frame(160)
+        self.assertEqual((w, h), (200, 200))  # canvas = cursor size * 40/32
+        self.assertEqual(len(data), 200 * 200 * 4)
+        self.assertEqual((hx, hy), (30, 30))
 
+    def test_ripple_frame_is_centred_on_tip(self):
+        art = main.CursorArt()
+        data, w, h, hx, hy = main.compose_ripples(art, 160, [0.0], 0.2, main.DEFAULT_CONFIG)
+        self.assertEqual((hx, hy), (w // 2, h // 2))
+        self.assertGreater(w, 2 * 160 * main.DEFAULT_CONFIG["ripple_max_radius"])
+        self.assertEqual(len(data), w * h * 4)
+
+
+class SpringTest(unittest.TestCase):
+    def run_spring(self, zeta, steps=300):
+        x, v, peak = 1.0, 0.0, 1.0
+        for _ in range(steps):
+            x, v = main.spring_step(x, v, 5.0, 260.0, zeta, 0.01)
+            peak = max(peak, x)
+        return x, peak
+
+    def test_underdamped_overshoots_then_settles(self):
+        x, peak = self.run_spring(0.45)
+        self.assertGreater(peak, 5.5)
+        self.assertAlmostEqual(x, 5.0, places=2)
+
+    def test_critically_damped_does_not_overshoot(self):
+        x, peak = self.run_spring(1.0)
+        self.assertLessEqual(peak, 5.0 + 1e-6)
+        self.assertAlmostEqual(x, 5.0, places=2)
 
 class StartupTest(unittest.TestCase):
     def setUp(self):
